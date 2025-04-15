@@ -6,338 +6,420 @@
     <title>ESP32 Audio Receiver</title>
     <style>
       body {
-        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        font-family: Arial, sans-serif;
         margin: 0;
         padding: 20px;
-        background-color: #f5f5f5;
-        color: #333;
         display: flex;
-        justify-content: center;
+        flex-direction: column;
         align-items: center;
-        min-height: 100vh;
       }
+
       .container {
-        max-width: 600px;
         width: 100%;
-        background-color: #fff;
-        padding: 20px;
-        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
-        border-radius: 8px;
+        max-width: 800px;
       }
-      h1 {
-        color: #2c3e50;
-        margin-top: 0;
-        text-align: center;
-      }
-      .status {
-        margin: 20px 0;
-        padding: 10px;
-        background-color: #e9f7fe;
-        border-left: 4px solid #3498db;
-        border-radius: 4px;
-        text-align: center;
-      }
-      .status.error {
-        background-color: #ffeaea;
-        border-left-color: #e74c3c;
-      }
-      .status.success {
-        background-color: #eafff2;
-        border-left-color: #2ecc71;
-      }
+
       canvas {
-        display: block;
         width: 100%;
-        height: 150px;
-        background-color: #2c3e50;
-        margin: 20px 0;
+        height: 200px;
+        background-color: #f0f0f0;
+        margin-bottom: 20px;
+        border: 1px solid #ddd;
+      }
+
+      .slider-container {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        margin-bottom: 20px;
+      }
+
+      #volumeSlider {
+        flex: 1;
+        margin: 0 10px;
+      }
+
+      .controls {
+        display: flex;
+        gap: 10px;
+        margin-bottom: 20px;
+      }
+
+      button {
+        padding: 8px 16px;
+        background-color: #4caf50;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+
+      button:hover {
+        background-color: #45a049;
+      }
+
+      button:disabled {
+        background-color: #cccccc;
+        cursor: not-allowed;
+      }
+
+      .status {
+        margin-bottom: 10px;
+        padding: 10px;
+        background-color: #f8f8f8;
+        border: 1px solid #ddd;
         border-radius: 4px;
       }
-      footer {
+
+      .debug-panel {
+        width: 100%;
+        height: 200px;
+        overflow-y: auto;
+        border: 1px solid #ddd;
+        background-color: #f8f8f8;
+        padding: 10px;
+        font-family: monospace;
+        font-size: 12px;
         margin-top: 20px;
-        text-align: center;
-        color: #7f8c8d;
-        font-size: 14px;
       }
     </style>
   </head>
   <body>
     <div class="container">
-      <h1>ESP32 Audio Stream</h1>
+      <h1>ESP32 Audio Receiver</h1>
 
-      <div id="connectionStatus" class="status">Connecting to server...</div>
+      <div class="status" id="statusContainer">
+        WebSocket: <span id="wsStatus">Disconnected</span><br />
+        Microphone: <span id="micStatus">Disabled</span><br />
+        Audio Packets: <span id="packetCount">0</span><br />
+        Last RMS: <span id="lastRms">0</span>
+      </div>
 
-      <canvas id="visualizer"></canvas>
+      <div class="controls">
+        <button id="enableMic">Enable Microphone</button>
+        <button id="disableMic">Disable Microphone</button>
+      </div>
 
-      <footer>ESP32-S3-DevKitc-1 Audio Stream Receiver</footer>
+      <canvas id="audioVisualizer"></canvas>
+
+      <div class="slider-container">
+        <span>Volume:</span>
+        <input
+          type="range"
+          id="volumeSlider"
+          min="0"
+          max="2"
+          step="0.1"
+          value="1"
+        />
+        <span id="volumeValue">100%</span>
+      </div>
+
+      <h3>Debug Information</h3>
+      <div class="debug-panel" id="debugPanel"></div>
     </div>
 
     <script>
-      // Audio context for playback
-      let audioContext = null;
-      let socket = null;
-      let isConnected = false;
+      // Audio context
+      let audioContext;
+      let gainNode;
 
-      // DOM elements
-      const connectionStatus = document.getElementById("connectionStatus");
-      const canvas = document.getElementById("visualizer");
-      const canvasCtx = canvas.getContext("2d");
+      // WebSocket
+      let socket;
+      let wsConnected = false;
+      let micEnabled = false;
+      let packetCount = 0;
+      let lastRmsValue = 0;
 
-      // Set actual canvas dimensions
-      function resizeCanvas() {
-        canvas.width = canvas.clientWidth;
-        canvas.height = canvas.clientHeight;
+      // Canvas and visualization
+      const canvas = document.getElementById("audioVisualizer");
+      const ctx = canvas.getContext("2d");
+
+      // Set canvas dimensions with devicePixelRatio for sharp rendering
+      function setupCanvas() {
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.scale(dpr, dpr);
       }
 
-      window.addEventListener("resize", resizeCanvas);
-      resizeCanvas();
+      // Debug logging function
+      function log(message, isError = false) {
+        const debugPanel = document.getElementById("debugPanel");
+        const timestamp = new Date().toLocaleTimeString();
+        const entry = document.createElement("div");
 
-      // Initialize audio context
-      function initAudio() {
-        try {
-          audioContext = new (window.AudioContext ||
-            window.webkitAudioContext)();
-          return true;
-        } catch (e) {
-          console.error("Error initializing audio context:", e);
-          connectionStatus.textContent =
-            "Error: Web Audio API not supported in this browser.";
-          connectionStatus.classList.add("error");
-          return false;
+        if (isError) {
+          entry.style.color = "red";
+          console.error(message);
+        }
+
+        entry.textContent = `[${timestamp}] ${message}`;
+        debugPanel.appendChild(entry);
+        debugPanel.scrollTop = debugPanel.scrollHeight;
+
+        // Keep a reasonable number of log entries (max 100)
+        while (debugPanel.childNodes.length > 100) {
+          debugPanel.removeChild(debugPanel.firstChild);
         }
       }
 
-      // Start WebSocket connection
+      // Update status display
+      function updateStatus() {
+        document.getElementById("wsStatus").textContent = wsConnected
+          ? "Connected"
+          : "Disconnected";
+        document.getElementById("wsStatus").style.color = wsConnected
+          ? "green"
+          : "red";
+
+        document.getElementById("micStatus").textContent = micEnabled
+          ? "Enabled"
+          : "Disabled";
+        document.getElementById("micStatus").style.color = micEnabled
+          ? "green"
+          : "red";
+
+        document.getElementById("packetCount").textContent = packetCount;
+        document.getElementById("lastRms").textContent =
+          lastRmsValue.toFixed(2);
+      }
+
+      // Initialize WebSocket connection
       function connectWebSocket() {
+        // Close existing connection if any
+        if (socket) {
+          socket.close();
+        }
+
+        // Determine WebSocket URL
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         const wsUrl = `${protocol}//${window.location.host}`;
 
+        log(`Connecting to WebSocket server at ${wsUrl}...`);
+
         socket = new WebSocket(wsUrl);
 
-        socket.onopen = (event) => {
-          isConnected = true;
-          connectionStatus.textContent =
-            "Connected to server - Audio streaming active";
-          connectionStatus.classList.add("success");
-          connectionStatus.classList.remove("error");
+        socket.onopen = function () {
+          wsConnected = true;
+          log("WebSocket connection established");
+          updateStatus();
 
-          console.log(
-            "[WebSocket] Connected successfully - ready to receive audio"
+          // Identify as a browser client
+          socket.send(
+            JSON.stringify({
+              type: "hello",
+              client: "browser",
+            })
           );
-
-          // Resume audio context (required by some browsers)
-          if (audioContext && audioContext.state === "suspended") {
-            audioContext.resume();
-          }
         };
 
-        socket.onclose = (event) => {
-          isConnected = false;
-          connectionStatus.textContent =
-            "Disconnected from server. Reconnecting...";
-          connectionStatus.classList.add("error");
-          connectionStatus.classList.remove("success");
-
-          console.log(
-            "[WebSocket] Connection closed. Attempting to reconnect in 5 seconds..."
+        socket.onclose = function (event) {
+          wsConnected = false;
+          log(
+            `WebSocket connection closed (code: ${event.code}${
+              event.reason ? ", reason: " + event.reason : ""
+            })`
           );
+          updateStatus();
 
           // Try to reconnect after a delay
-          setTimeout(connectWebSocket, 5000);
+          setTimeout(connectWebSocket, 2000);
         };
 
-        socket.onerror = (error) => {
-          console.error("WebSocket error:", error);
-          connectionStatus.textContent =
-            "WebSocket error - check console for details";
-          connectionStatus.classList.add("error");
+        socket.onerror = function (error) {
+          log(`WebSocket error occurred`, true);
+          wsConnected = false;
+          updateStatus();
         };
 
-        socket.onmessage = (event) => {
+        socket.onmessage = function (event) {
           try {
-            if (typeof event.data === "string") {
-              try {
-                // Parse JSON message
-                const data = JSON.parse(event.data);
+            const data = JSON.parse(event.data);
 
-                console.log("Received message type:", data.type);
-
-                if (data.type === "audio" && data.format === "pcm") {
-                  // Handle PCM audio data
-                  const pcmData = new Int16Array(data.data);
-
-                  console.log(
-                    `Received audio data: ${pcmData.length} samples, sample rate: ${data.sampleRate}`
-                  );
-
-                  // Only process if there's actual audio data
-                  if (pcmData && pcmData.length > 0) {
-                    try {
-                      // Check for non-zero values
-                      let nonZeroCount = 0;
-                      let maxAmplitude = 0;
-
-                      for (let i = 0; i < pcmData.length; i++) {
-                        if (pcmData[i] !== 0) {
-                          nonZeroCount++;
-                          maxAmplitude = Math.max(
-                            maxAmplitude,
-                            Math.abs(pcmData[i])
-                          );
-                        }
-                      }
-
-                      console.log(
-                        `Audio data quality: ${nonZeroCount}/${
-                          pcmData.length
-                        } non-zero samples (${(
-                          (nonZeroCount / pcmData.length) *
-                          100
-                        ).toFixed(1)}%), max amplitude: ${maxAmplitude}`
-                      );
-
-                      if (nonZeroCount === 0) {
-                        console.warn(
-                          "Received all-zero audio data, no sound will be produced"
-                        );
-                        return; // Skip processing zero data
-                      }
-
-                      // Convert to audio buffer for playback and visualization
-                      const buffer = audioContext.createBuffer(
-                        1,
-                        pcmData.length,
-                        data.sampleRate || 16000
-                      );
-                      const channelData = buffer.getChannelData(0);
-
-                      // Convert Int16 to Float32 (-1 to 1)
-                      for (let i = 0; i < pcmData.length; i++) {
-                        channelData[i] = pcmData[i] / 32768.0;
-                      }
-
-                      // Always play the audio
-                      const source = audioContext.createBufferSource();
-                      source.buffer = buffer;
-                      source.connect(audioContext.destination);
-
-                      // Add event listeners to track playback
-                      source.onended = () => {
-                        console.log("[Audio] Playback completed");
-                      };
-
-                      console.log(
-                        `[Audio] Starting playback of ${pcmData.length} samples at ${data.sampleRate}Hz`
-                      );
-                      source.start();
-
-                      // Visualize audio data
-                      visualizeAudio(channelData);
-                    } catch (audioError) {
-                      console.error(
-                        "[Audio ERROR] Failed to process or play audio:",
-                        audioError.message
-                      );
-                      console.error("[Audio ERROR] Data details:", {
-                        length: pcmData?.length,
-                        sampleRate: data.sampleRate,
-                        hasData: !!pcmData,
-                        nonZeroSamples: nonZeroCount,
-                        maxAmplitude: maxAmplitude,
-                      });
-                    }
-                  } else {
-                    console.warn("Received empty audio data");
-                  }
-                } else if (data.type === "status") {
-                  console.log("Status update:", data);
-                  connectionStatus.textContent = `Connected to server - ${
-                    data.clients || 0
-                  } client(s)`;
-                } else if (data.type === "info") {
-                  console.log("Server info:", data.message);
-                  // Show message briefly in the status area
-                  const originalText = connectionStatus.textContent;
-                  connectionStatus.textContent = data.message;
-                  setTimeout(() => {
-                    connectionStatus.textContent = originalText;
-                  }, 3000);
-                }
-              } catch (jsonError) {
-                console.error(
-                  "Error parsing JSON message:",
-                  jsonError,
-                  "Raw message:",
-                  event.data.substring(0, 100)
-                );
-              }
-            } else if (
-              event.data instanceof Blob ||
-              event.data instanceof ArrayBuffer
-            ) {
-              // Ignore binary data
-              console.warn(
-                "Received unexpected binary data of size:",
-                event.data.byteLength || event.data.size || "unknown"
+            // Handle status updates
+            if (data.type === "status") {
+              log(
+                `Status update - Clients: ${data.clients}, ESP32: ${data.esp32Devices}, Browsers: ${data.browserClients}`
               );
             }
-          } catch (e) {
-            console.error("Error handling message:", e);
+            // Handle info messages
+            else if (data.type === "info") {
+              log(`Server info: ${data.message}`);
+            }
+            // Handle PCM audio data
+            else if (
+              data.type === "audio" &&
+              data.format === "pcm" &&
+              Array.isArray(data.data)
+            ) {
+              // Check if we have actual data (non-zero values)
+              let hasNonZero = false;
+              let maxValue = 0;
+              let rmsValue = 0;
+
+              // Calculate RMS and max amplitude
+              if (data.data.length > 0) {
+                const sumSquared = data.data.reduce((sum, sample) => {
+                  const value = Math.abs(sample);
+                  maxValue = Math.max(maxValue, value);
+                  hasNonZero = hasNonZero || value > 0;
+                  return sum + sample * sample;
+                }, 0);
+
+                rmsValue = Math.sqrt(sumSquared / data.data.length);
+                lastRmsValue = rmsValue;
+              }
+
+              // Log audio packet details occasionally
+              packetCount++;
+              if (packetCount % 20 === 0) {
+                log(
+                  `Audio packet #${packetCount} - Length: ${
+                    data.data.length
+                  }, Max: ${maxValue}, RMS: ${rmsValue.toFixed(2)}`
+                );
+              }
+
+              // Update status
+              updateStatus();
+
+              // Only visualize if we have actual data
+              if (hasNonZero) {
+                visualizeAudio(data.data, maxValue);
+              } else {
+                log(`Received audio packet with all zeros`, true);
+              }
+            }
+          } catch (error) {
+            log(`Error processing message: ${error.message}`, true);
           }
         };
       }
 
-      // Visualize audio data
-      function visualizeAudio(audioData) {
-        if (!canvasCtx) return;
-
-        const width = canvas.width;
-        const height = canvas.height;
-        const bufferLength = audioData.length;
-
-        // Clear canvas
-        canvasCtx.fillStyle = "#2c3e50";
-        canvasCtx.fillRect(0, 0, width, height);
-
-        // Draw waveform
-        canvasCtx.lineWidth = 2;
-        canvasCtx.strokeStyle = "#3498db";
-        canvasCtx.beginPath();
-
-        const sliceWidth = width / bufferLength;
-        let x = 0;
-
-        for (let i = 0; i < bufferLength; i++) {
-          const v = audioData[i];
-          const y = (v * 0.5 + 0.5) * height;
-
-          if (i === 0) {
-            canvasCtx.moveTo(x, y);
-          } else {
-            canvasCtx.lineTo(x, y);
-          }
-
-          x += sliceWidth;
+      // Draw audio visualization
+      function visualizeAudio(pcmData, maxAmplitude) {
+        if (!canvas.width || !canvas.height) {
+          setupCanvas();
         }
 
-        canvasCtx.lineTo(width, height / 2);
-        canvasCtx.stroke();
+        // Clear canvas
+        ctx.clearRect(
+          0,
+          0,
+          canvas.width / window.devicePixelRatio,
+          canvas.height / window.devicePixelRatio
+        );
+
+        const width = canvas.width / window.devicePixelRatio;
+        const height = canvas.height / window.devicePixelRatio;
+        const centerY = height / 2;
+
+        // Draw waveform
+        ctx.beginPath();
+        ctx.strokeStyle = "#0066cc";
+        ctx.lineWidth = 2;
+
+        // Dynamic scaling based on the maximum amplitude
+        const scaleFactor = Math.min(1, 32767 / Math.max(maxAmplitude, 1000));
+        const amplitudeScale = (height / 2) * 0.9 * scaleFactor;
+
+        const sliceSize = Math.max(1, Math.floor(pcmData.length / width));
+
+        for (let i = 0; i < width; i++) {
+          const dataIndex = Math.min(i * sliceSize, pcmData.length - 1);
+          const sample = pcmData[dataIndex] || 0;
+          const y = centerY - (sample / 32767) * amplitudeScale;
+
+          if (i === 0) {
+            ctx.moveTo(i, y);
+          } else {
+            ctx.lineTo(i, y);
+          }
+        }
+
+        ctx.stroke();
       }
 
-      // Document loaded - start everything
-      document.addEventListener("DOMContentLoaded", () => {
-        // User interaction is required to start audio context in some browsers
-        document.body.addEventListener("click", () => {
-          if (audioContext && audioContext.state === "suspended") {
-            audioContext.resume();
+      // Add event listeners
+      document
+        .getElementById("enableMic")
+        .addEventListener("click", function () {
+          if (wsConnected) {
+            log("Sending mic_on command");
+            socket.send(
+              JSON.stringify({
+                type: "command",
+                action: "mic_on",
+              })
+            );
+            micEnabled = true;
+            updateStatus();
+          } else {
+            log("Cannot enable microphone - WebSocket not connected", true);
           }
         });
 
-        // Initialize audio and connect to WebSocket
-        if (initAudio()) {
-          connectWebSocket();
+      document
+        .getElementById("disableMic")
+        .addEventListener("click", function () {
+          if (wsConnected) {
+            log("Sending mic_off command");
+            socket.send(
+              JSON.stringify({
+                type: "command",
+                action: "mic_off",
+              })
+            );
+            micEnabled = false;
+            updateStatus();
+          } else {
+            log("Cannot disable microphone - WebSocket not connected", true);
+          }
+        });
+
+      // Volume control
+      const volumeSlider = document.getElementById("volumeSlider");
+      const volumeValue = document.getElementById("volumeValue");
+
+      volumeSlider.addEventListener("input", function () {
+        const volume = parseFloat(volumeSlider.value);
+        volumeValue.textContent = `${Math.round(volume * 100)}%`;
+
+        if (gainNode) {
+          gainNode.gain.value = volume;
         }
       });
+
+      // Initialize
+      function initialize() {
+        setupCanvas();
+        connectWebSocket();
+
+        // Initialize Audio Context
+        try {
+          window.AudioContext =
+            window.AudioContext || window.webkitAudioContext;
+          audioContext = new AudioContext();
+          gainNode = audioContext.createGain();
+          gainNode.gain.value = parseFloat(volumeSlider.value);
+          gainNode.connect(audioContext.destination);
+
+          log("Audio context initialized");
+        } catch (error) {
+          log(`Failed to initialize audio context: ${error.message}`, true);
+        }
+
+        // Handle window resize
+        window.addEventListener("resize", setupCanvas);
+
+        log("Application initialized");
+        updateStatus();
+      }
+
+      // Start application
+      initialize();
     </script>
   </body>
 </html>

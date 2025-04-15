@@ -6,8 +6,9 @@
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
-const fs = require("fs");
 const path = require("path");
+const fs = require("fs");
+const sslRedirect = require("heroku-ssl-redirect").default;
 
 /**
  * ADPCM Decoder - Decodes ADPCM audio streams from ESP32 clients
@@ -134,224 +135,153 @@ class ADPCMDecoder {
   }
 }
 
-// Configuration
-const PORT = 3012;
-const HTTP_PORT = PORT;
-const WS_PORT = PORT;
-
-// Create Express app and HTTP server
+// Server configuration
 const app = express();
+const port = process.env.PORT || 3012;
 const server = http.createServer(app);
-
-// Create WebSocket server
 const wss = new WebSocket.Server({ server });
 
-// Serve static files
-app.use(express.static(path.join(__dirname, "public")));
-
-// Stats
+// Client tracking
 let connectedClients = 0;
-let totalBytesReceived = 0;
+let esp32Devices = 0;
+let browserClients = 0;
+let audioPacketsReceived = 0;
 let totalAudioPackets = 0;
 
-// Create audio output directory if it doesn't exist
-const audioDir = path.join(__dirname, "audio");
-if (!fs.existsSync(audioDir)) {
-  fs.mkdirSync(audioDir);
+// Timestamp logging function
+function log(message) {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${message}`);
 }
+
+// SSL redirect middleware
+app.use(sslRedirect());
+
+// Serve static files from the public directory
+app.use(express.static(path.join(__dirname, "public")));
+
+// Home route
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
 
 // WebSocket connection handler
 wss.on("connection", (ws, req) => {
-  const clientIP = req.socket.remoteAddress;
+  const clientIp = req.socket.remoteAddress;
+  console.log(`New WebSocket connection from ${clientIp}`);
   connectedClients++;
+  updateClientCount();
 
-  console.log(
-    `[${new Date().toISOString()}] New client connected: ${clientIP} (Total: ${connectedClients})`
-  );
-
-  // Create ADPCM decoder for this client
-  const decoder = new ADPCMDecoder();
-
-  // Track client type
-  ws.isESP32 = false;
-
-  // Variables for this connection
-  let isRecording = false;
-  let clientBytesReceived = 0;
-  let clientAudioPackets = 0;
-  let recordingPath = null;
-  let recordingStream = null;
-
-  // Send initial state to client
+  // Send initial status to the client
   ws.send(
     JSON.stringify({
       type: "status",
-      connected: true,
-      clients: connectedClients,
+      clientCount: connectedClients,
+      totalAudioPackets,
     })
   );
+
+  // Set initial state
+  ws.isAlive = true;
+  ws.isESP32 = false;
+  ws.isBrowser = false;
+
+  // Ping-pong heartbeat
+  ws.on("pong", () => {
+    ws.isAlive = true;
+  });
 
   // Message handler
   ws.on("message", (message) => {
     try {
-      if (typeof message === "string") {
-        try {
-          // Try parsing as JSON (for ESP32 JSON messages)
-          const jsonData = JSON.parse(message);
+      // Check if message is a Buffer or string
+      if (message instanceof Buffer) {
+        // Binary message - forward as raw audio
+        console.log(`Received binary data: ${message.length} bytes`);
 
-          // Handle ESP32 JSON audio data
+        // Forward binary data to all browser clients
+        wss.clients.forEach((client) => {
           if (
-            jsonData.type === "audio" &&
-            jsonData.format === "pcm" &&
-            Array.isArray(jsonData.data)
+            client !== ws &&
+            client.readyState === WebSocket.OPEN &&
+            !client.isESP32
           ) {
-            // Mark this client as ESP32
-            ws.isESP32 = true;
-            clientAudioPackets++;
-            totalAudioPackets++;
-
-            // Extract PCM data
-            const pcmData = jsonData.data;
-            const sampleRate = jsonData.sampleRate || 44100;
-
-            // Forward to all browser clients
-            wss.clients.forEach((client) => {
-              if (
-                client !== ws &&
-                client.readyState === WebSocket.OPEN &&
-                !client.isESP32
-              ) {
-                client.send(message); // Forward as-is
-              }
-            });
-
-            return;
+            client.send(message);
           }
+        });
+        return;
+      }
 
-          // Handle command JSON
-          if (jsonData.type === "command") {
-            if (jsonData.action === "mic_on") {
-              console.log(
-                `[${new Date().toISOString()}] Sending mic_on command`
-              );
-              // Forward to all ESP32 clients
-              wss.clients.forEach((client) => {
-                if (client.isESP32 && client.readyState === WebSocket.OPEN) {
-                  client.send("mic_on");
-                }
-              });
-            } else if (jsonData.action === "mic_off") {
-              console.log(
-                `[${new Date().toISOString()}] Sending mic_off command`
-              );
-              // Forward to all ESP32 clients
-              wss.clients.forEach((client) => {
-                if (client.isESP32 && client.readyState === WebSocket.OPEN) {
-                  client.send("mic_off");
-                }
-              });
-            }
-          }
-        } catch (e) {
-          // Not JSON, try as plain text commands
-          if (
-            message === "mic_on" ||
-            message === "mic_off" ||
-            message === "mic_check"
-          ) {
-            // Forward simple commands to all ESP32 clients
-            wss.clients.forEach((client) => {
-              if (client.isESP32 && client.readyState === WebSocket.OPEN) {
-                client.send(message);
-              }
-            });
-          }
-        }
-      } else if (Buffer.isBuffer(message) || message instanceof ArrayBuffer) {
-        // Mark this client as ESP32
+      // Try parsing as JSON
+      const jsonData = JSON.parse(message);
+
+      // Handle device info
+      if (jsonData.type === "device_info") {
         ws.isESP32 = true;
+        console.log(`Device connected: ${JSON.stringify(jsonData)}`);
 
-        // Handle binary messages (audio data)
-        const buffer = Buffer.from(message);
-        clientBytesReceived += buffer.length;
-        totalBytesReceived += buffer.length;
-
-        try {
-          // Process the audio packet
-          const packet = ADPCMDecoder.processPacket(buffer);
-
-          if (packet.type === 1) {
-            // Audio packet
-            clientAudioPackets++;
-            totalAudioPackets++;
-
-            // Validate data
-            if (!packet.data || packet.data.length === 0) {
-              console.error(
-                `[${new Date().toISOString()}] Empty audio data in packet`
-              );
-              return;
-            }
-
-            let pcmSamples;
-            if (packet.format === 1) {
-              // ADPCM
-              pcmSamples = decoder.decode(packet.data);
-            } else {
-              // Raw PCM
-              pcmSamples = new Int16Array(
-                packet.data.buffer,
-                packet.data.byteOffset,
-                packet.data.length / 2
-              );
-            }
-
-            // Check if we have any non-zero audio samples
-            let hasNonZeroSamples = false;
-            let maxSample = 0;
-            for (let i = 0; i < Math.min(pcmSamples.length, 1000); i++) {
-              if (pcmSamples[i] !== 0) {
-                hasNonZeroSamples = true;
-                maxSample = Math.max(maxSample, Math.abs(pcmSamples[i]));
-              }
-            }
-
-            // Forward to all web clients if non-zero
-            if (hasNonZeroSamples) {
-              wss.clients.forEach((client) => {
-                if (
-                  client !== ws &&
-                  client.readyState === WebSocket.OPEN &&
-                  !client.isESP32
-                ) {
-                  const dataToSend = {
-                    type: "audio",
-                    format: "pcm",
-                    sampleRate: 44100,
-                    channels: 1,
-                    bitsPerSample: 16,
-                    data: Array.from(
-                      pcmSamples.slice(0, Math.min(pcmSamples.length, 1000))
-                    ), // Limit array size
-                  };
-                  client.send(JSON.stringify(dataToSend));
-                }
-              });
-            }
+        // Forward device info to all browser clients
+        wss.clients.forEach((client) => {
+          if (
+            client !== ws &&
+            client.readyState === WebSocket.OPEN &&
+            !client.isESP32
+          ) {
+            client.send(message);
           }
-        } catch (e) {
-          // If packet processing fails, might be raw audio data without header
-          console.error(
-            `[${new Date().toISOString()}] Error processing packet: ${
-              e.message
-            }`
+        });
+      }
+
+      // Handle ESP32 JSON audio data
+      else if (
+        jsonData.type === "audio" &&
+        jsonData.format === "pcm" &&
+        Array.isArray(jsonData.data)
+      ) {
+        ws.isESP32 = true;
+        audioPacketsReceived++;
+        totalAudioPackets++;
+
+        // Process audio data (apply noise gate etc.)
+        const processedData = processAudioData(jsonData);
+
+        // Forward to all browser clients
+        const forwardingData = JSON.stringify(processedData);
+        wss.clients.forEach((client) => {
+          if (
+            client !== ws &&
+            client.readyState === WebSocket.OPEN &&
+            !client.isESP32
+          ) {
+            client.send(forwardingData);
+          }
+        });
+
+        // Log audio stats occasionally
+        if (totalAudioPackets % 100 === 0) {
+          console.log(
+            `Audio packet #${totalAudioPackets}: ${
+              jsonData.data.length
+            } samples, Max: ${
+              processedData.maxAmplitude
+            }, RMS: ${processedData.rms.toFixed(2)}`
           );
         }
       }
-    } catch (e) {
-      console.error(
-        `[${new Date().toISOString()}] Error handling message: ${e.message}`
-      );
+
+      // Handle browser commands
+      else if (jsonData.type === "command") {
+        console.log(`Command received: ${JSON.stringify(jsonData)}`);
+
+        // Forward commands only to ESP32 clients
+        wss.clients.forEach((client) => {
+          if (client.readyState === WebSocket.OPEN && client.isESP32) {
+            client.send(message);
+          }
+        });
+      }
+    } catch (error) {
+      console.error("Error processing message:", error.message);
     }
   });
 
@@ -359,40 +289,120 @@ wss.on("connection", (ws, req) => {
   ws.on("close", () => {
     connectedClients--;
 
-    // Stop recording if active
-    if (isRecording && recordingStream) {
-      recordingStream.end();
-      console.log(
-        `[${new Date().toISOString()}] Stopped recording due to client disconnect`
+    if (ws.isESP32) {
+      esp32Devices--;
+      log(`ESP32 device disconnected - Total ESP32 devices: ${esp32Devices}`);
+    } else if (ws.isBrowser) {
+      browserClients--;
+      log(
+        `Browser client disconnected - Total browser clients: ${browserClients}`
       );
     }
 
-    console.log(
-      `[${new Date().toISOString()}] Client disconnected: ${clientIP} (Total: ${connectedClients})`
-    );
+    log(`Client disconnected - Total clients: ${connectedClients}`);
+    broadcastStatus();
+  });
 
-    // Notify other clients
-    wss.clients.forEach((client) => {
-      if (client !== ws && client.readyState === WebSocket.OPEN) {
-        client.send(
-          JSON.stringify({
-            type: "status",
-            clients: connectedClients,
-          })
-        );
-      }
-    });
+  // Error handler
+  ws.on("error", (error) => {
+    log(`WebSocket error: ${error.message}`);
   });
 });
 
-// Start server
-server.listen(HTTP_PORT, () => {
-  const serverStartTime = new Date().toISOString();
-  console.log(`[${serverStartTime}] ================================`);
-  console.log(`[${serverStartTime}] ESP32 Audio Server Started`);
-  console.log(`[${serverStartTime}] HTTP server running on port ${HTTP_PORT}`);
-  console.log(
-    `[${serverStartTime}] Open http://localhost:${HTTP_PORT} in your browser`
-  );
-  console.log(`[${serverStartTime}] ================================`);
+// Broadcast server status to all clients
+function broadcastStatus() {
+  const statusMessage = JSON.stringify({
+    type: "status",
+    clients: connectedClients,
+    esp32Devices: esp32Devices,
+    browserClients: browserClients,
+    audioPackets: totalAudioPackets,
+  });
+
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(statusMessage);
+    }
+  });
+}
+
+// Process audio data (apply noise gate and forward to clients)
+function processAudioData(audioData) {
+  // Convert to Int16Array for processing
+  const samples = new Int16Array(audioData.data);
+  const sampleCount = samples.length;
+
+  // Calculate audio statistics
+  let maxAmplitude = 0;
+  let sumSquares = 0;
+
+  for (let i = 0; i < sampleCount; i++) {
+    const absValue = Math.abs(samples[i]);
+    if (absValue > maxAmplitude) {
+      maxAmplitude = absValue;
+    }
+    sumSquares += samples[i] * samples[i];
+  }
+
+  // Calculate RMS (Root Mean Square)
+  const rms = Math.sqrt(sumSquares / sampleCount);
+
+  // Apply dynamic noise gate
+  // - Use a lower threshold for higher RMS values
+  // - Use a higher threshold for lower RMS values
+  const baseThreshold = 200;
+  const dynamicThreshold = baseThreshold * (1 - Math.min(1, rms / 5000));
+  const noiseGateThreshold = Math.max(50, dynamicThreshold);
+
+  // Apply noise gate
+  const processedSamples = applyNoiseGate(samples, noiseGateThreshold);
+
+  // Return processed data
+  return {
+    type: "audio",
+    format: "pcm",
+    sampleRate: audioData.sampleRate,
+    data: Array.from(processedSamples),
+    maxAmplitude: maxAmplitude,
+    rms: rms,
+    threshold: noiseGateThreshold,
+  };
+}
+
+// Apply noise gate to audio samples
+function applyNoiseGate(samples, threshold) {
+  const processedSamples = new Int16Array(samples.length);
+
+  for (let i = 0; i < samples.length; i++) {
+    if (Math.abs(samples[i]) < threshold) {
+      processedSamples[i] = 0; // Zero out low amplitude samples
+    } else {
+      processedSamples[i] = samples[i]; // Keep higher amplitude samples
+    }
+  }
+
+  return processedSamples;
+}
+
+// Heartbeat to check for dead connections
+const intervalId = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      log("Terminating inactive connection");
+      return ws.terminate();
+    }
+
+    ws.isAlive = false;
+    ws.ping(() => {});
+  });
+}, 30000);
+
+// Clean up interval on server close
+wss.on("close", () => {
+  clearInterval(intervalId);
+});
+
+// Start the server
+server.listen(port, () => {
+  log(`Server started on port ${port}`);
 });
