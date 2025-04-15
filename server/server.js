@@ -27,9 +27,6 @@ function log(message) {
   console.log(`[${timestamp}] ${message}`);
 }
 
-// SSL redirect middleware
-app.use(sslRedirect());
-
 // Serve static files from the public directory
 app.use(express.static(path.join(__dirname, "public")));
 
