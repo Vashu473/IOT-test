@@ -7,133 +7,6 @@ const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const path = require("path");
-const fs = require("fs");
-const sslRedirect = require("heroku-ssl-redirect").default;
-
-/**
- * ADPCM Decoder - Decodes ADPCM audio streams from ESP32 clients
- */
-class ADPCMDecoder {
-  constructor() {
-    // ADPCM step size table
-    this.stepTable = [
-      7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41,
-      45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190,
-      209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
-      876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499,
-      2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845,
-      8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385,
-      24623, 27086, 29794, 32767,
-    ];
-
-    // ADPCM index table
-    this.indexTable = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
-
-    // Reset the decoder state
-    this.reset();
-  }
-
-  /**
-   * Reset decoder state
-   */
-  reset() {
-    this.valprev = 0; // Previous output value
-    this.index = 0; // Index into step size table
-  }
-
-  /**
-   * Decode a single 4-bit ADPCM code to a 16-bit PCM sample
-   *
-   * @param {number} code - 4-bit ADPCM code (0-15)
-   * @returns {number} - 16-bit PCM sample
-   */
-  decodeSample(code) {
-    // Get step size from table
-    const step = this.stepTable[this.index];
-
-    // Compute difference
-    let diff = step >> 3;
-    if (code & 4) diff += step;
-    if (code & 2) diff += step >> 1;
-    if (code & 1) diff += step >> 2;
-
-    // Add or subtract from previous value
-    if (code & 8) {
-      this.valprev -= diff;
-    } else {
-      this.valprev += diff;
-    }
-
-    // Clamp to 16-bit range
-    this.valprev = Math.max(-32768, Math.min(32767, this.valprev));
-
-    // Update index value
-    this.index += this.indexTable[code];
-    this.index = Math.max(0, Math.min(88, this.index));
-
-    return this.valprev;
-  }
-
-  /**
-   * Decode ADPCM buffer to PCM
-   *
-   * @param {Buffer} adpcmData - Buffer containing ADPCM data
-   * @returns {Int16Array} - PCM samples
-   */
-  decode(adpcmData) {
-    const pcmSamples = new Int16Array(adpcmData.length * 2);
-
-    // Reset decoder state before decoding a new buffer
-    this.reset();
-
-    for (let i = 0; i < adpcmData.length; i++) {
-      // Each byte contains two 4-bit ADPCM codes
-      const byte = adpcmData[i];
-
-      // High nibble (first sample)
-      const code1 = (byte >> 4) & 0x0f;
-      pcmSamples[i * 2] = this.decodeSample(code1);
-
-      // Low nibble (second sample)
-      const code2 = byte & 0x0f;
-      pcmSamples[i * 2 + 1] = this.decodeSample(code2);
-    }
-
-    return pcmSamples;
-  }
-
-  /**
-   * Process incoming ESP32 audio packet
-   *
-   * @param {Buffer} data - Binary data from WebSocket
-   * @returns {Object} - Object containing decoded audio data
-   */
-  static processPacket(data) {
-    if (data.length < 6) {
-      throw new Error("Invalid packet size");
-    }
-
-    // Parse header
-    const packetType = data[0];
-    const dataSize =
-      data[1] | (data[2] << 8) | (data[3] << 16) | (data[4] << 24);
-    const format = data[5]; // 0 = raw PCM, 1 = ADPCM
-
-    if (packetType !== 1) {
-      throw new Error("Not an audio packet");
-    }
-
-    // Extract the audio data (skip the 6-byte header)
-    const audioData = data.slice(6, 6 + dataSize);
-
-    return {
-      type: packetType,
-      format: format,
-      size: dataSize,
-      data: audioData,
-    };
-  }
-}
 
 // Server configuration
 const app = express();
@@ -170,7 +43,7 @@ wss.on("connection", (ws, req) => {
   const clientIp = req.socket.remoteAddress;
   console.log(`New WebSocket connection from ${clientIp}`);
   connectedClients++;
-  updateClientCount();
+  broadcastStatus();
 
   // Send initial status to the client
   ws.send(
