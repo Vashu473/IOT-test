@@ -103,7 +103,7 @@
       let lastRmsValue = 0;
       let reconnectTimer;
 
-      // Canvas and visualization
+      // Canvas and visualization`
       const canvas = document.getElementById("audioVisualizer");
       const ctx = canvas.getContext("2d");
 
@@ -347,6 +347,20 @@
         }
       }
 
+      // Audio packet format constants
+      const PACKET_HEADER_MAGIC = 0xa5;
+      const PACKET_TYPE_AUDIO = 0x01;
+      const PACKET_HEADER_SIZE = 8;
+
+      // Calculate checksum in same way as ESP32 and server
+      function calculateAudioChecksum(audioData) {
+        let sum = 0;
+        for (let i = 0; i < audioData.length; i++) {
+          sum += Math.abs(audioData[i]);
+        }
+        return sum % 65536; // Match ESP32 implementation
+      }
+
       // Process binary data for audio playback
       function processBinaryAudio(data) {
         try {
@@ -394,12 +408,15 @@
         }
       }
 
+      // Audio context and nodes
+      let audioFrameCount = 0;
+
       // Helper function to process arraybuffer of audio data
       function processArrayBuffer(buffer) {
         return new Promise((resolve, reject) => {
           try {
             // Safety check for buffer size
-            if (!buffer || buffer.byteLength < 8) {
+            if (!buffer || buffer.byteLength < PACKET_HEADER_SIZE) {
               reject(
                 new Error(
                   `Invalid buffer size: ${buffer ? buffer.byteLength : 0} bytes`
@@ -416,7 +433,10 @@
             const packetType = view.getUint8(1);
 
             // Validate packet format
-            if (magicByte !== 0xa5 || packetType !== 0x01) {
+            if (
+              magicByte !== PACKET_HEADER_MAGIC ||
+              packetType !== PACKET_TYPE_AUDIO
+            ) {
               reject(
                 new Error(
                   `Unknown packet format: Magic=${magicByte}, Type=${packetType}`
@@ -425,10 +445,15 @@
               return;
             }
 
-            // Parse header
+            // Parse header - all big-endian (network byte order)
             const sequenceNumber = view.getUint16(2); // big-endian
             const numSamples = view.getUint16(4); // big-endian
             const checksum = view.getUint16(6); // big-endian
+
+            // Log header info for debugging
+            console.log(
+              `Received packet #${sequenceNumber}: ${numSamples} samples, checksum=${checksum}`
+            );
 
             // Quick sanity check on sample count
             if (numSamples <= 0 || numSamples > 8192) {
@@ -437,17 +462,19 @@
             }
 
             // Validate buffer size against header
-            const expectedSize = 8 + numSamples * 2; // 8-byte header + audio data
+            const expectedSize = PACKET_HEADER_SIZE + numSamples * 2; // 8-byte header + audio data
             if (buffer.byteLength < expectedSize) {
               log(
                 `Warning: Packet size mismatch - expected ${expectedSize} bytes, got ${buffer.byteLength}`,
                 true
               );
               // We'll still process what we have, but adjust the sample count
-              numSamples = Math.floor((buffer.byteLength - 8) / 2);
+              numSamples = Math.floor(
+                (buffer.byteLength - PACKET_HEADER_SIZE) / 2
+              );
             }
 
-            // Extract audio samples (16-bit PCM)
+            // Extract audio samples (16-bit PCM) - in big-endian (network byte order)
             const audioData = new Int16Array(numSamples);
 
             // Compute checksum as we extract samples
@@ -455,14 +482,17 @@
 
             for (let i = 0; i < numSamples; i++) {
               // Extract sample (big-endian format from ESP32)
-              audioData[i] = view.getInt16(8 + i * 2, false); // false = big-endian
+              audioData[i] = view.getInt16(PACKET_HEADER_SIZE + i * 2, false); // false = big-endian
 
               // Update checksum
               calculatedChecksum += Math.abs(audioData[i]);
             }
 
+            // Modulo to match ESP32 and server
+            calculatedChecksum = calculatedChecksum % 65536;
+
             // Verify checksum (with some tolerance)
-            if (Math.abs(calculatedChecksum - checksum) > numSamples) {
+            if (Math.abs(calculatedChecksum - checksum) > 100) {
               log(
                 `Warning: Checksum mismatch - received=${checksum}, calculated=${calculatedChecksum}`,
                 true
@@ -508,9 +538,6 @@
         });
       }
 
-      // Audio context and nodes
-      let audioFrameCount = 0;
-
       // Play audio data using Web Audio API
       function playPCMAudio(audioData) {
         // Skip empty buffers
@@ -531,9 +558,20 @@
           let maxValue = 0;
           let sumSquared = 0;
 
+          // Apply dynamic compression to improve voice clarity
           for (let i = 0; i < audioData.length; i++) {
             // Convert to float and apply volume
-            floatData[i] = (audioData[i] / int16Max) * volumeSlider.value;
+            let sample = audioData[i] / int16Max;
+
+            // Apply compression - reduce dynamic range for voice
+            if (sample > 0.1) {
+              sample = 0.1 + (sample - 0.1) * 0.8; // Soft compression above threshold
+            } else if (sample < -0.1) {
+              sample = -0.1 + (sample + 0.1) * 0.8; // Soft compression below threshold
+            }
+
+            // Apply volume
+            floatData[i] = sample * volumeSlider.value;
 
             // Calculate stats on volume-adjusted data
             const absValue = Math.abs(floatData[i]);

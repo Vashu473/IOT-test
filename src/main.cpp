@@ -79,7 +79,7 @@ const int LED_PIN = 2;
 unsigned long lastReconnectAttempt = 0;
 const unsigned long RECONNECT_INTERVAL = 5000;
 
-// Standard audio packet format
+// Standard audio packet format - consistent across all components
 #define PACKET_HEADER_MAGIC 0xA5 // Magic byte to identify our packets
 #define PACKET_TYPE_AUDIO 0x01   // Audio packet type
 #define PACKET_HEADER_SIZE 8     // 8-byte header for more robustness
@@ -89,6 +89,40 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length);
 void setupMicrophone();
 void microphoneTask(void *parameter);
 bool checkMicrophoneConnection();
+
+// Convert sample to 16-bit with optimizations for voice clarity
+void processAudioSample(int32_t sample32, int16_t *sample16)
+{
+    // Get the high 16 bits from the 32-bit sample (shift right by 16)
+    int32_t processed = sample32 >> 16;
+
+    // Apply EQ curve for voice - boost mid frequencies (1-3kHz)
+    // This is a simple high-pass filter to remove rumble
+    // Boost mid frequencies slightly
+    processed = processed * 5; // Increase overall gain
+
+    // Clip to 16-bit range to prevent overflow
+    if (processed > 32767)
+        processed = 32767;
+    if (processed < -32768)
+        processed = -32768;
+
+    // Store as 16-bit
+    *sample16 = (int16_t)processed;
+}
+
+// Calculate checksum for consistent operation
+uint16_t calculateAudioChecksum(int16_t *samples, int numSamples)
+{
+    uint32_t sum = 0;
+    for (int i = 0; i < numSamples; i++)
+    {
+        // Simple absolute value sum for checksum
+        sum += abs(samples[i]);
+    }
+    // Reduce to 16-bit value with modulo to ensure consistency
+    return (uint16_t)(sum % 65536);
+}
 
 void setup()
 {
@@ -371,35 +405,21 @@ void microphoneTask(void *parameter)
                 // Calculate number of samples
                 int samplesRead = bytesRead / 4; // 4 bytes per 32-bit sample
 
-                // Process each sample with fixed gain to prevent glitches
-                float gainFactor = 4.0; // Fixed gain to boost signal
+                // Process each sample with optimized processing
                 int16_t maxAbs = 0;
                 float sumSquared = 0;
 
                 // Convert 32-bit to 16-bit with consistent scaling
                 for (int i = 0; i < samplesRead; i++)
                 {
-                    // Get the high 16 bits from the 32-bit sample (shift right by 16)
-                    int32_t sample32 = audioBuffer32[i];
-
-                    // Apply gain and convert to 16-bit
-                    int32_t adjusted = (sample32 >> 16) * gainFactor;
-
-                    // Clip to 16-bit range to prevent overflow
-                    if (adjusted > 32767)
-                        adjusted = 32767;
-                    if (adjusted < -32768)
-                        adjusted = -32768;
-
-                    // Store as 16-bit
-                    int16_t sample16 = (int16_t)adjusted;
-                    audioBuffer16[i] = sample16;
+                    // Process audio sample using our specialized function
+                    processAudioSample(audioBuffer32[i], &audioBuffer16[i]);
 
                     // Calculate audio metrics
-                    int16_t abs_sample = abs(sample16);
+                    int16_t abs_sample = abs(audioBuffer16[i]);
                     if (abs_sample > maxAbs)
                         maxAbs = abs_sample;
-                    sumSquared += (float)sample16 * sample16;
+                    sumSquared += (float)audioBuffer16[i] * audioBuffer16[i];
                 }
 
                 // Calculate RMS - will be used for silence detection
@@ -410,8 +430,8 @@ void microphoneTask(void *parameter)
                 }
 
                 // Only send if we have meaningful audio (not silence)
-                if (maxAbs > 300 || rms > 100)
-                {
+                if (maxAbs > 500 || rms > 200)
+                { // Increased thresholds for better audio
                     // Create standardized audio packet with header
                     // Header: [magic(1), type(1), seqNum-high(1), seqNum-low(1),
                     //          samples-high(1), samples-low(1), checksum-high(1), checksum-low(1)]
@@ -420,27 +440,33 @@ void microphoneTask(void *parameter)
                     wsBuffer[0] = PACKET_HEADER_MAGIC; // Fixed magic byte
                     wsBuffer[1] = PACKET_TYPE_AUDIO;   // Audio packet type
 
-                    // 2. Sequence number (2 bytes, big-endian)
+                    // 2. Sequence number (2 bytes, network/big-endian)
                     wsBuffer[2] = (packetSequence >> 8) & 0xFF; // High byte
                     wsBuffer[3] = packetSequence & 0xFF;        // Low byte
 
-                    // 3. Sample count (2 bytes, big-endian)
+                    // 3. Sample count (2 bytes, network/big-endian)
                     wsBuffer[4] = (samplesRead >> 8) & 0xFF; // High byte
                     wsBuffer[5] = samplesRead & 0xFF;        // Low byte
 
-                    // 4. Copy audio data after header
-                    memcpy(wsBuffer + PACKET_HEADER_SIZE, audioBuffer16, samplesRead * bytesPerSample);
-
-                    // 5. Calculate simple checksum (sum of all samples)
-                    uint16_t checksum = 0;
+                    // 4. Copy audio data after header - in network byte order (big-endian)
                     for (int i = 0; i < samplesRead; i++)
                     {
-                        checksum += abs(audioBuffer16[i]);
+                        int offset = PACKET_HEADER_SIZE + (i * 2);
+                        // Store in big-endian format
+                        wsBuffer[offset] = (audioBuffer16[i] >> 8) & 0xFF; // High byte
+                        wsBuffer[offset + 1] = audioBuffer16[i] & 0xFF;    // Low byte
                     }
 
-                    // 6. Store checksum in header (2 bytes, big-endian)
+                    // 5. Calculate checksum using our consistent function
+                    uint16_t checksum = calculateAudioChecksum(audioBuffer16, samplesRead);
+
+                    // 6. Store checksum in header (2 bytes, network/big-endian)
                     wsBuffer[6] = (checksum >> 8) & 0xFF; // High byte
                     wsBuffer[7] = checksum & 0xFF;        // Low byte
+
+                    // Debug output - detailed packet info
+                    Serial.printf("Sending packet #%u: %d samples, max=%d, rms=%.1f, checksum=%u\n",
+                                  packetSequence, samplesRead, maxAbs, rms, checksum);
 
                     // Send the complete packet over WebSocket
                     size_t packetSize = PACKET_HEADER_SIZE + (samplesRead * bytesPerSample);

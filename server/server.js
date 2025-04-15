@@ -184,6 +184,25 @@ function broadcastStatus() {
   });
 }
 
+// Calculate audio checksum with same algorithm as ESP32
+function calculateAudioChecksum(buffer, offset, numSamples) {
+  let sum = 0;
+  for (let i = 0; i < numSamples; i++) {
+    // Read each sample in big-endian order
+    const sampleOffset = offset + i * 2;
+    if (sampleOffset + 1 < buffer.length) {
+      // Read as big-endian (same as network byte order)
+      const sample = (buffer[sampleOffset] << 8) | buffer[sampleOffset + 1];
+      // Convert to signed 16-bit if needed
+      const signedSample = sample > 32767 ? sample - 65536 : sample;
+      // Add absolute value to sum
+      sum += Math.abs(signedSample);
+    }
+  }
+  // Use modulo to match ESP32 implementation
+  return sum % 65536;
+}
+
 // Process audio data (apply noise gate and forward to clients)
 function processAudioData(ws, data) {
   try {
@@ -205,11 +224,12 @@ function processAudioData(ws, data) {
       return;
     }
 
-    // Parse the header
+    // Parse the header using big-endian (network byte order)
     const seqNum = (data[2] << 8) | data[3];
     const numSamples = (data[4] << 8) | data[5];
     const checksum = (data[6] << 8) | data[7];
 
+    // Log packet information
     console.log(
       `Received audio packet #${seqNum}: ${numSamples} samples, checksum: ${checksum}`
     );
@@ -228,15 +248,15 @@ function processAudioData(ws, data) {
     }
 
     // Verify checksum
-    let calculatedChecksum = 0;
-    for (let i = 0; i < numSamples; i++) {
-      const offset = PACKET_HEADER_SIZE + i * 2;
-      const sample = data.readInt16BE(offset); // Read as big-endian
-      calculatedChecksum += Math.abs(sample);
-    }
+    const calculatedChecksum = calculateAudioChecksum(
+      data,
+      PACKET_HEADER_SIZE,
+      numSamples
+    );
 
-    // If checksums don't match (roughly), log but still continue
-    if (Math.abs(calculatedChecksum - checksum) > numSamples) {
+    // If checksums don't match, log the issue
+    if (Math.abs(calculatedChecksum - checksum) > 100) {
+      // Allow small differences
       console.warn(
         `Checksum mismatch: received=${checksum}, calculated=${calculatedChecksum}`
       );
@@ -247,6 +267,7 @@ function processAudioData(ws, data) {
     wss.clients.forEach((client) => {
       if (client !== ws && client.readyState === WebSocket.OPEN) {
         try {
+          // Send the packet as-is (header + data)
           client.send(data);
           sentCount++;
         } catch (err) {
