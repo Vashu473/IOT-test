@@ -20,6 +20,12 @@ let esp32Devices = 0;
 let browserClients = 0;
 let audioPacketsReceived = 0;
 let totalAudioPackets = 0;
+let packetCount = 0;
+
+// ESP32 audio packet constants
+const PACKET_HEADER_MAGIC = 0xa5;
+const PACKET_TYPE_AUDIO = 0x01;
+const PACKET_HEADER_SIZE = 8;
 
 // Timestamp logging function
 function log(message) {
@@ -40,6 +46,26 @@ wss.on("connection", (ws, req) => {
   const clientIp = req.socket.remoteAddress;
   console.log(`New WebSocket connection from ${clientIp}`);
   connectedClients++;
+
+  // Start with unidentified client
+  ws.isESP32 = false;
+  ws.isBrowser = false;
+
+  // Log the connection headers
+  console.log(`Connection headers: ${JSON.stringify(req.headers)}`);
+
+  // Try to identify browser clients by headers
+  const userAgent = req.headers["user-agent"] || "";
+  if (
+    userAgent.includes("Mozilla") ||
+    userAgent.includes("Chrome") ||
+    userAgent.includes("Safari")
+  ) {
+    ws.isBrowser = true;
+    browserClients++;
+    console.log(`Browser client auto-identified by User-Agent: ${userAgent}`);
+  }
+
   broadcastStatus();
 
   // Send initial status to the client
@@ -53,8 +79,6 @@ wss.on("connection", (ws, req) => {
 
   // Set initial state
   ws.isAlive = true;
-  ws.isESP32 = false;
-  ws.isBrowser = false;
 
   // Ping-pong heartbeat
   ws.on("pong", () => {
@@ -64,94 +88,58 @@ wss.on("connection", (ws, req) => {
   // Message handler
   ws.on("message", (message) => {
     try {
-      // Check if message is a Buffer or string
+      // Binary message handling
       if (message instanceof Buffer) {
-        // Binary message - forward as raw audio
-        console.log(`Received binary data: ${message.length} bytes`);
-
-        // Forward binary data to all browser clients
-        wss.clients.forEach((client) => {
-          if (
-            client !== ws &&
-            client.readyState === WebSocket.OPEN &&
-            !client.isESP32
-          ) {
-            client.send(message);
-          }
-        });
+        // Process binary data from ESP32
+        processAudioData(ws, message);
         return;
       }
 
-      // Try parsing as JSON
-      const jsonData = JSON.parse(message);
+      // If not binary, parse as JSON message
+      try {
+        const data = JSON.parse(message);
 
-      // Handle device info
-      if (jsonData.type === "device_info") {
-        ws.isESP32 = true;
-        console.log(`Device connected: ${JSON.stringify(jsonData)}`);
-
-        // Forward device info to all browser clients
-        wss.clients.forEach((client) => {
-          if (
-            client !== ws &&
-            client.readyState === WebSocket.OPEN &&
-            !client.isESP32
-          ) {
-            client.send(message);
-          }
-        });
-      }
-
-      // Handle ESP32 JSON audio data
-      else if (
-        jsonData.type === "audio" &&
-        jsonData.format === "pcm" &&
-        Array.isArray(jsonData.data)
-      ) {
-        ws.isESP32 = true;
-        audioPacketsReceived++;
-        totalAudioPackets++;
-
-        // Process audio data (apply noise gate etc.)
-        const processedData = processAudioData(jsonData);
-
-        // Forward to all browser clients
-        const forwardingData = JSON.stringify(processedData);
-        wss.clients.forEach((client) => {
-          if (
-            client !== ws &&
-            client.readyState === WebSocket.OPEN &&
-            !client.isESP32
-          ) {
-            client.send(forwardingData);
-          }
-        });
-
-        // Log audio stats occasionally
-        if (totalAudioPackets % 100 === 0) {
-          console.log(
-            `Audio packet #${totalAudioPackets}: ${
-              jsonData.data.length
-            } samples, Max: ${
-              processedData.maxAmplitude
-            }, RMS: ${processedData.rms.toFixed(2)}`
+        // Handle client identification
+        if (data.type === "hello" && data.client === "browser") {
+          ws.isBrowser = true;
+          browserClients++;
+          log(
+            `Browser client identified - Total browser clients: ${browserClients}`
           );
         }
-      }
 
-      // Handle browser commands
-      else if (jsonData.type === "command") {
-        console.log(`Command received: ${JSON.stringify(jsonData)}`);
+        // Handle ESP32 identification
+        if (data.type === "hello" && data.client === "esp32") {
+          ws.isESP32 = true;
+          esp32Devices++;
+          log(`ESP32 device identified - Total ESP32 devices: ${esp32Devices}`);
+        }
 
-        // Forward commands only to ESP32 clients
-        wss.clients.forEach((client) => {
-          if (client.readyState === WebSocket.OPEN && client.isESP32) {
-            client.send(message);
+        // Handle commands from browser to ESP32
+        if (data.type === "command") {
+          // Forward mic control commands to ESP32 devices
+          if (data.action === "mic_on" || data.action === "mic_off") {
+            log(`Forwarding command: ${data.action}`);
+
+            // Format command in the way ESP32 expects
+            const command = JSON.stringify({
+              command: data.action,
+            });
+
+            // Send to all ESP32 clients
+            wss.clients.forEach((client) => {
+              if (client.isESP32 && client.readyState === WebSocket.OPEN) {
+                client.send(command);
+              }
+            });
           }
-        });
+        }
+      } catch (jsonError) {
+        console.error("Invalid JSON message:", jsonError.message);
       }
     } catch (error) {
-      console.error("Error processing message:", error.message);
+      console.error(`Error processing message: ${error.message}`);
+      console.error(error.stack);
     }
   });
 
@@ -197,61 +185,99 @@ function broadcastStatus() {
 }
 
 // Process audio data (apply noise gate and forward to clients)
-function processAudioData(audioData) {
-  // Convert to Int16Array for processing
-  const samples = new Int16Array(audioData.data);
-  const sampleCount = samples.length;
-
-  // Calculate audio statistics
-  let maxAmplitude = 0;
-  let sumSquares = 0;
-
-  for (let i = 0; i < sampleCount; i++) {
-    const absValue = Math.abs(samples[i]);
-    if (absValue > maxAmplitude) {
-      maxAmplitude = absValue;
+function processAudioData(ws, data) {
+  try {
+    // Safety check - minimum packet size for our new format
+    if (!data || data.length < PACKET_HEADER_SIZE) {
+      console.warn(
+        `Received invalid audio packet (too small): ${
+          data ? data.length : 0
+        } bytes`
+      );
+      return;
     }
-    sumSquares += samples[i] * samples[i];
+
+    // Check magic byte and packet type
+    if (data[0] !== PACKET_HEADER_MAGIC || data[1] !== PACKET_TYPE_AUDIO) {
+      console.log(
+        `Ignoring non-standard packet: Magic=${data[0]}, Type=${data[1]}, expected Magic=${PACKET_HEADER_MAGIC}, Type=${PACKET_TYPE_AUDIO}`
+      );
+      return;
+    }
+
+    // Parse the header
+    const seqNum = (data[2] << 8) | data[3];
+    const numSamples = (data[4] << 8) | data[5];
+    const checksum = (data[6] << 8) | data[7];
+
+    console.log(
+      `Received audio packet #${seqNum}: ${numSamples} samples, checksum: ${checksum}`
+    );
+
+    // Calculate expected data size
+    const dataSizeBytes = numSamples * 2; // 16-bit samples = 2 bytes each
+
+    // Validate packet size
+    if (data.length < PACKET_HEADER_SIZE + dataSizeBytes) {
+      console.warn(
+        `Audio packet too small: ${data.length} bytes, expected ${
+          PACKET_HEADER_SIZE + dataSizeBytes
+        }`
+      );
+      return;
+    }
+
+    // Verify checksum
+    let calculatedChecksum = 0;
+    for (let i = 0; i < numSamples; i++) {
+      const offset = PACKET_HEADER_SIZE + i * 2;
+      const sample = data.readInt16BE(offset); // Read as big-endian
+      calculatedChecksum += Math.abs(sample);
+    }
+
+    // If checksums don't match (roughly), log but still continue
+    if (Math.abs(calculatedChecksum - checksum) > numSamples) {
+      console.warn(
+        `Checksum mismatch: received=${checksum}, calculated=${calculatedChecksum}`
+      );
+    }
+
+    // Forward to all clients
+    let sentCount = 0;
+    wss.clients.forEach((client) => {
+      if (client !== ws && client.readyState === WebSocket.OPEN) {
+        try {
+          client.send(data);
+          sentCount++;
+        } catch (err) {
+          console.error(`Error sending audio to client: ${err.message}`);
+        }
+      }
+    });
+
+    console.log(`Forwarded audio packet #${seqNum} to ${sentCount} clients`);
+
+    // Log statistics occasionally
+    totalAudioPackets++;
+    if (totalAudioPackets % 100 === 0) {
+      console.log(`Total audio packets processed: ${totalAudioPackets}`);
+    }
+  } catch (error) {
+    console.error(`Error processing audio data: ${error.message}`);
+    console.error(error.stack);
   }
-
-  // Calculate RMS (Root Mean Square)
-  const rms = Math.sqrt(sumSquares / sampleCount);
-
-  // Apply dynamic noise gate
-  // - Use a lower threshold for higher RMS values
-  // - Use a higher threshold for lower RMS values
-  const baseThreshold = 200;
-  const dynamicThreshold = baseThreshold * (1 - Math.min(1, rms / 5000));
-  const noiseGateThreshold = Math.max(50, dynamicThreshold);
-
-  // Apply noise gate
-  const processedSamples = applyNoiseGate(samples, noiseGateThreshold);
-
-  // Return processed data
-  return {
-    type: "audio",
-    format: "pcm",
-    sampleRate: audioData.sampleRate,
-    data: Array.from(processedSamples),
-    maxAmplitude: maxAmplitude,
-    rms: rms,
-    threshold: noiseGateThreshold,
-  };
 }
 
-// Apply noise gate to audio samples
-function applyNoiseGate(samples, threshold) {
-  const processedSamples = new Int16Array(samples.length);
-
-  for (let i = 0; i < samples.length; i++) {
-    if (Math.abs(samples[i]) < threshold) {
-      processedSamples[i] = 0; // Zero out low amplitude samples
-    } else {
-      processedSamples[i] = samples[i]; // Keep higher amplitude samples
+// Helper function to send binary data to all clients
+function sendToAllClients(data, excludeClient = null) {
+  let count = 0;
+  wss.clients.forEach((client) => {
+    if (client !== excludeClient && client.readyState === WebSocket.OPEN) {
+      client.send(data);
+      count++;
     }
-  }
-
-  return processedSamples;
+  });
+  return count;
 }
 
 // Heartbeat to check for dead connections

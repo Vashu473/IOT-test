@@ -27,6 +27,14 @@
         border: 1px solid #ddd;
       }
 
+      .status {
+        margin-bottom: 10px;
+        padding: 10px;
+        background-color: #f8f8f8;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+      }
+
       .slider-container {
         width: 100%;
         display: flex;
@@ -37,38 +45,6 @@
       #volumeSlider {
         flex: 1;
         margin: 0 10px;
-      }
-
-      .controls {
-        display: flex;
-        gap: 10px;
-        margin-bottom: 20px;
-      }
-
-      button {
-        padding: 8px 16px;
-        background-color: #4caf50;
-        color: white;
-        border: none;
-        border-radius: 4px;
-        cursor: pointer;
-      }
-
-      button:hover {
-        background-color: #45a049;
-      }
-
-      button:disabled {
-        background-color: #cccccc;
-        cursor: not-allowed;
-      }
-
-      .status {
-        margin-bottom: 10px;
-        padding: 10px;
-        background-color: #f8f8f8;
-        border: 1px solid #ddd;
-        border-radius: 4px;
       }
 
       .debug-panel {
@@ -90,14 +66,8 @@
 
       <div class="status" id="statusContainer">
         WebSocket: <span id="wsStatus">Disconnected</span><br />
-        Microphone: <span id="micStatus">Disabled</span><br />
         Audio Packets: <span id="packetCount">0</span><br />
         Last RMS: <span id="lastRms">0</span>
-      </div>
-
-      <div class="controls">
-        <button id="enableMic">Enable Microphone</button>
-        <button id="disableMic">Disable Microphone</button>
       </div>
 
       <canvas id="audioVisualizer"></canvas>
@@ -121,15 +91,17 @@
 
     <script>
       // Audio context
-      let audioContext;
-      let gainNode;
+      let audioContext = null;
+      let gainNode = null;
+      let audioQueue = [];
+      let isPlaying = false;
 
       // WebSocket
       let socket;
       let wsConnected = false;
-      let micEnabled = false;
       let packetCount = 0;
       let lastRmsValue = 0;
+      let reconnectTimer;
 
       // Canvas and visualization
       const canvas = document.getElementById("audioVisualizer");
@@ -173,14 +145,6 @@
         document.getElementById("wsStatus").style.color = wsConnected
           ? "green"
           : "red";
-
-        document.getElementById("micStatus").textContent = micEnabled
-          ? "Enabled"
-          : "Disabled";
-        document.getElementById("micStatus").style.color = micEnabled
-          ? "green"
-          : "red";
-
         document.getElementById("packetCount").textContent = packetCount;
         document.getElementById("lastRms").textContent =
           lastRmsValue.toFixed(2);
@@ -207,12 +171,18 @@
           updateStatus();
 
           // Identify as a browser client
-          socket.send(
-            JSON.stringify({
+          try {
+            log("Sending browser identification message");
+            const identMessage = JSON.stringify({
               type: "hello",
               client: "browser",
-            })
-          );
+              userAgent: navigator.userAgent,
+            });
+            socket.send(identMessage);
+            log("Identification message sent");
+          } catch (err) {
+            log("Error sending identification: " + err.message, true);
+          }
         };
 
         socket.onclose = function (event) {
@@ -225,7 +195,8 @@
           updateStatus();
 
           // Try to reconnect after a delay
-          setTimeout(connectWebSocket, 2000);
+          clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(connectWebSocket, 2000);
         };
 
         socket.onerror = function (error) {
@@ -236,64 +207,40 @@
 
         socket.onmessage = function (event) {
           try {
-            const data = JSON.parse(event.data);
+            log(`Received WebSocket message of type: ${typeof event.data}`);
 
-            // Handle status updates
-            if (data.type === "status") {
-              log(
-                `Status update - Clients: ${data.clients}, ESP32: ${data.esp32Devices}, Browsers: ${data.browserClients}`
-              );
-            }
-            // Handle info messages
-            else if (data.type === "info") {
-              log(`Server info: ${data.message}`);
-            }
-            // Handle PCM audio data
-            else if (
-              data.type === "audio" &&
-              data.format === "pcm" &&
-              Array.isArray(data.data)
+            if (
+              event.data instanceof Blob ||
+              event.data instanceof ArrayBuffer
             ) {
-              // Check if we have actual data (non-zero values)
-              let hasNonZero = false;
-              let maxValue = 0;
-              let rmsValue = 0;
+              // Log binary data details
+              const size =
+                event.data instanceof Blob
+                  ? event.data.size
+                  : event.data.byteLength;
+              log(`Received binary data: ${size} bytes`);
 
-              // Calculate RMS and max amplitude
-              if (data.data.length > 0) {
-                const sumSquared = data.data.reduce((sum, sample) => {
-                  const value = Math.abs(sample);
-                  maxValue = Math.max(maxValue, value);
-                  hasNonZero = hasNonZero || value > 0;
-                  return sum + sample * sample;
-                }, 0);
+              // Binary data (audio)
+              processBinaryAudio(event.data);
+            } else {
+              // Text data (JSON messages)
+              log(`Received text message: ${event.data.substring(0, 100)}...`);
+              try {
+                const message = JSON.parse(event.data);
+                log(`Server message type: ${message.type}`);
 
-                rmsValue = Math.sqrt(sumSquared / data.data.length);
-                lastRmsValue = rmsValue;
-              }
-
-              // Log audio packet details occasionally
-              packetCount++;
-              if (packetCount % 20 === 0) {
-                log(
-                  `Audio packet #${packetCount} - Length: ${
-                    data.data.length
-                  }, Max: ${maxValue}, RMS: ${rmsValue.toFixed(2)}`
-                );
-              }
-
-              // Update status
-              updateStatus();
-
-              // Only visualize if we have actual data
-              if (hasNonZero) {
-                visualizeAudio(data.data, maxValue);
-              } else {
-                log(`Received audio packet with all zeros`, true);
+                // Handle server status messages
+                if (message.type === "status") {
+                  updateStatus();
+                }
+              } catch (error) {
+                console.error("Error parsing JSON message:", error);
+                log(`Error parsing message: ${error.message}`, true);
               }
             }
           } catch (error) {
-            log(`Error processing message: ${error.message}`, true);
+            console.error("Error in WebSocket onmessage:", error);
+            log(`WebSocket onmessage error: ${error.message}`, true);
           }
         };
       }
@@ -342,43 +289,6 @@
         ctx.stroke();
       }
 
-      // Add event listeners
-      document
-        .getElementById("enableMic")
-        .addEventListener("click", function () {
-          if (wsConnected) {
-            log("Sending mic_on command");
-            socket.send(
-              JSON.stringify({
-                type: "command",
-                action: "mic_on",
-              })
-            );
-            micEnabled = true;
-            updateStatus();
-          } else {
-            log("Cannot enable microphone - WebSocket not connected", true);
-          }
-        });
-
-      document
-        .getElementById("disableMic")
-        .addEventListener("click", function () {
-          if (wsConnected) {
-            log("Sending mic_off command");
-            socket.send(
-              JSON.stringify({
-                type: "command",
-                action: "mic_off",
-              })
-            );
-            micEnabled = false;
-            updateStatus();
-          } else {
-            log("Cannot disable microphone - WebSocket not connected", true);
-          }
-        });
-
       // Volume control
       const volumeSlider = document.getElementById("volumeSlider");
       const volumeValue = document.getElementById("volumeValue");
@@ -397,25 +307,270 @@
         setupCanvas();
         connectWebSocket();
 
-        // Initialize Audio Context
-        try {
-          window.AudioContext =
-            window.AudioContext || window.webkitAudioContext;
-          audioContext = new AudioContext();
-          gainNode = audioContext.createGain();
-          gainNode.gain.value = parseFloat(volumeSlider.value);
-          gainNode.connect(audioContext.destination);
-
-          log("Audio context initialized");
-        } catch (error) {
-          log(`Failed to initialize audio context: ${error.message}`, true);
-        }
-
-        // Handle window resize
-        window.addEventListener("resize", setupCanvas);
+        // Initialize Audio Context on user interaction
+        document.addEventListener("click", initAudioContext);
+        document.addEventListener("touchstart", initAudioContext);
 
         log("Application initialized");
         updateStatus();
+      }
+
+      // Initialize audio context with user interaction
+      function initAudioContext() {
+        if (audioContext === null) {
+          try {
+            audioContext = new (window.AudioContext ||
+              window.webkitAudioContext)({
+              sampleRate: 16000, // Match ESP32 sample rate
+              latencyHint: "interactive",
+            });
+
+            // Create a gain node for volume control
+            gainNode = audioContext.createGain();
+            gainNode.gain.value = volumeSlider.value;
+            gainNode.connect(audioContext.destination);
+
+            // Resume audio context if needed
+            if (audioContext.state === "suspended") {
+              audioContext.resume();
+            }
+
+            log(
+              "Audio context initialized with sample rate: " +
+                audioContext.sampleRate +
+                "Hz"
+            );
+          } catch (e) {
+            console.error("Error initializing AudioContext:", e);
+            log("Error initializing audio: " + e.message, true);
+          }
+        }
+      }
+
+      // Process binary data for audio playback
+      function processBinaryAudio(data) {
+        try {
+          // Handle binary data (audio)
+          let arrayBuffer;
+
+          if (data instanceof Blob) {
+            // Convert Blob to ArrayBuffer
+            const reader = new FileReader();
+
+            reader.onload = function () {
+              processArrayBuffer(reader.result)
+                .then((audioData) => {
+                  playPCMAudio(audioData);
+                })
+                .catch((error) => {
+                  console.error("Error processing audio data:", error);
+                  log("Error processing audio: " + error.message, true);
+                });
+            };
+
+            reader.onerror = function () {
+              console.error("Error reading blob:", reader.error);
+              log("Error reading blob data", true);
+            };
+
+            reader.readAsArrayBuffer(data);
+          } else if (data instanceof ArrayBuffer) {
+            // Process ArrayBuffer directly
+            processArrayBuffer(data)
+              .then((audioData) => {
+                playPCMAudio(audioData);
+              })
+              .catch((error) => {
+                console.error("Error processing audio data:", error);
+                log("Error processing audio: " + error.message, true);
+              });
+          } else {
+            console.error("Unknown binary data type:", typeof data);
+            log("Unknown binary data type", true);
+          }
+        } catch (error) {
+          console.error("Error in processBinaryAudio:", error);
+          log("Error processing binary audio: " + error.message, true);
+        }
+      }
+
+      // Helper function to process arraybuffer of audio data
+      function processArrayBuffer(buffer) {
+        return new Promise((resolve, reject) => {
+          try {
+            // Safety check for buffer size
+            if (!buffer || buffer.byteLength < 8) {
+              reject(
+                new Error(
+                  `Invalid buffer size: ${buffer ? buffer.byteLength : 0} bytes`
+                )
+              );
+              return;
+            }
+
+            // Create a DataView to read header information
+            const view = new DataView(buffer);
+
+            // Check magic byte and packet type
+            const magicByte = view.getUint8(0);
+            const packetType = view.getUint8(1);
+
+            // Validate packet format
+            if (magicByte !== 0xa5 || packetType !== 0x01) {
+              reject(
+                new Error(
+                  `Unknown packet format: Magic=${magicByte}, Type=${packetType}`
+                )
+              );
+              return;
+            }
+
+            // Parse header
+            const sequenceNumber = view.getUint16(2); // big-endian
+            const numSamples = view.getUint16(4); // big-endian
+            const checksum = view.getUint16(6); // big-endian
+
+            // Quick sanity check on sample count
+            if (numSamples <= 0 || numSamples > 8192) {
+              reject(new Error(`Invalid sample count: ${numSamples}`));
+              return;
+            }
+
+            // Validate buffer size against header
+            const expectedSize = 8 + numSamples * 2; // 8-byte header + audio data
+            if (buffer.byteLength < expectedSize) {
+              log(
+                `Warning: Packet size mismatch - expected ${expectedSize} bytes, got ${buffer.byteLength}`,
+                true
+              );
+              // We'll still process what we have, but adjust the sample count
+              numSamples = Math.floor((buffer.byteLength - 8) / 2);
+            }
+
+            // Extract audio samples (16-bit PCM)
+            const audioData = new Int16Array(numSamples);
+
+            // Compute checksum as we extract samples
+            let calculatedChecksum = 0;
+
+            for (let i = 0; i < numSamples; i++) {
+              // Extract sample (big-endian format from ESP32)
+              audioData[i] = view.getInt16(8 + i * 2, false); // false = big-endian
+
+              // Update checksum
+              calculatedChecksum += Math.abs(audioData[i]);
+            }
+
+            // Verify checksum (with some tolerance)
+            if (Math.abs(calculatedChecksum - checksum) > numSamples) {
+              log(
+                `Warning: Checksum mismatch - received=${checksum}, calculated=${calculatedChecksum}`,
+                true
+              );
+              // Continue processing anyway
+            }
+
+            // Calculate audio stats
+            let maxValue = 0;
+            let sumSquared = 0;
+
+            for (let i = 0; i < audioData.length; i++) {
+              const value = Math.abs(audioData[i]);
+              maxValue = Math.max(maxValue, value);
+              sumSquared += audioData[i] * audioData[i];
+            }
+
+            const rmsValue = Math.sqrt(sumSquared / audioData.length);
+            lastRmsValue = rmsValue;
+
+            // Update packet count and status
+            packetCount++;
+            updateStatus();
+
+            // Log occasionally
+            if (packetCount % 20 === 0) {
+              log(
+                `Audio packet #${packetCount} (seq: ${sequenceNumber}) - Length: ${
+                  audioData.length
+                }, Max: ${maxValue}, RMS: ${rmsValue.toFixed(2)}`
+              );
+            }
+
+            // Visualize the audio
+            visualizeAudio(audioData, maxValue);
+
+            resolve(audioData);
+          } catch (error) {
+            console.error("Error processing array buffer:", error);
+            // Return empty array instead of rejecting to keep the audio flow going
+            resolve(new Int16Array(0));
+          }
+        });
+      }
+
+      // Audio context and nodes
+      let audioFrameCount = 0;
+
+      // Play audio data using Web Audio API
+      function playPCMAudio(audioData) {
+        // Skip empty buffers
+        if (!audioData || audioData.length === 0) {
+          return;
+        }
+
+        try {
+          // Initialize Audio Context if needed
+          if (!audioContext) {
+            initAudioContext();
+          }
+
+          // Convert Int16 audio data to Float32
+          const floatData = new Float32Array(audioData.length);
+          const int16Max = 32768; // 2^15
+
+          let maxValue = 0;
+          let sumSquared = 0;
+
+          for (let i = 0; i < audioData.length; i++) {
+            // Convert to float and apply volume
+            floatData[i] = (audioData[i] / int16Max) * volumeSlider.value;
+
+            // Calculate stats on volume-adjusted data
+            const absValue = Math.abs(floatData[i]);
+            maxValue = Math.max(maxValue, absValue);
+            sumSquared += floatData[i] * floatData[i];
+          }
+
+          // Create buffer
+          const buffer = audioContext.createBuffer(
+            1,
+            floatData.length,
+            audioContext.sampleRate
+          );
+          buffer.getChannelData(0).set(floatData);
+
+          // Create source and play
+          const source = audioContext.createBufferSource();
+          source.buffer = buffer;
+          source.connect(gainNode);
+          source.start();
+
+          // Log audio stats periodically
+          audioFrameCount++;
+          if (audioFrameCount % 100 === 0) {
+            const rms = Math.sqrt(sumSquared / floatData.length);
+            log(
+              `Audio playback stats - Max: ${(maxValue * 100).toFixed(
+                2
+              )}%, RMS: ${(rms * 100).toFixed(2)}%, Volume: ${
+                volumeSlider.value * 100
+              }%`
+            );
+          }
+        } catch (err) {
+          console.error("Error playing audio:", err);
+          log("Error playing audio: " + err.message, true);
+        }
       }
 
       // Start application
