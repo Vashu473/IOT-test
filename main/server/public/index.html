@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>ESP32-CAM Stream</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <link
+      href="https://fonts.googleapis.com/css?family=Roboto"
+      rel="stylesheet"
+      type="text/css"
+    />
+    <script src="https://cdn.jsdelivr.net/npm/darkmode-js@1.5.7/lib/darkmode-js.min.js"></script>
+    <script
+      src="https://cdn.plot.ly/plotly-latest.min.js"
+      charset="utf-8"
+    ></script>
+    <script src="https://unpkg.com/pcm-player"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/aurora.js/0.4.2/aurora.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/aac/1.0.0/aac.min.js"></script>
+    <style>
+      body {
+        font-family: "Roboto", sans-serif;
+        margin: 20px;
+        background-color: #f0f0f0;
+        overflow-x: hidden;
+      }
+      .container {
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 20px;
+        background-color: white;
+        border-radius: 10px;
+        box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+      }
+      .stream-container {
+        position: relative;
+        width: 100%;
+        margin-bottom: 20px;
+        background-color: #000;
+        border-radius: 5px;
+        overflow: hidden;
+      }
+      #stream {
+        width: 100%;
+        max-width: 640px;
+        height: auto;
+        display: block;
+        margin: 0 auto;
+        border: 2px solid #ddd;
+        border-radius: 5px;
+        transform: scaleX(-1); /* Mirror the image */
+      }
+      .controls {
+        text-align: center;
+        margin: 20px 0;
+        display: flex;
+        justify-content: center;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      button {
+        padding: 10px 20px;
+        margin: 5px;
+        font-size: 16px;
+        cursor: pointer;
+        background-color: #4caf50;
+        color: white;
+        border: none;
+        border-radius: 5px;
+        transition: background-color 0.3s;
+      }
+      button:hover {
+        background-color: #45a049;
+      }
+      button:disabled {
+        background-color: #cccccc;
+        cursor: not-allowed;
+      }
+      button.active {
+        background-color: #f44336;
+      }
+      #debug {
+        margin-top: 20px;
+        padding: 10px;
+        background-color: #f8f8f8;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+        font-family: monospace;
+        font-size: 14px;
+        max-height: 200px;
+        overflow-y: auto;
+      }
+      #status {
+        margin: 10px 0;
+        padding: 10px;
+        text-align: center;
+        font-weight: bold;
+        border-radius: 5px;
+      }
+      .error {
+        color: red;
+        background-color: #ffebee;
+      }
+      .success {
+        color: green;
+        background-color: #e8f5e9;
+      }
+      .stats {
+        display: flex;
+        justify-content: center;
+        gap: 20px;
+        margin: 10px 0;
+        font-size: 14px;
+        color: #666;
+        flex-wrap: wrap;
+      }
+      .loading {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        color: white;
+        font-size: 18px;
+      }
+      .audio-container {
+        margin: 20px 0;
+        padding: 15px;
+        background-color: #f5f5f5;
+        border-radius: 5px;
+        text-align: center;
+      }
+      .audio-visualizer {
+        width: 100%;
+        height: 100px;
+        background-color: #000;
+        margin: 10px 0;
+        position: relative;
+        border-radius: 5px;
+        overflow: hidden;
+      }
+      .audio-bar {
+        position: absolute;
+        bottom: 0;
+        width: 100%;
+        background-color: #4caf50;
+        height: 0;
+        transition: height 0.1s ease;
+      }
+      .audio-label {
+        color: #333;
+        font-weight: bold;
+        margin-bottom: 10px;
+        display: block;
+      }
+      .audio-stats {
+        display: flex;
+        justify-content: space-around;
+        margin-top: 10px;
+        font-size: 12px;
+        color: #666;
+      }
+      .volume-control {
+        margin: 15px 0;
+      }
+      #graph {
+        width: 100%;
+        height: 150px;
+        margin: 15px 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1 style="text-align: center">ESP32-S3 INMP441 Microphone</h1>
+      <div id="status">Connecting...</div>
+      <div class="stats">
+        <span id="latency">Latency: 0ms</span>
+        <span id="audio-status">Audio: Disabled</span>
+      </div>
+
+      <div id="graph"></div>
+
+      <div class="audio-container">
+        <h3>Electrobot INMP441 MEMS Digital Microphone</h3>
+        <span class="audio-label">Live Microphone Signal</span>
+        <div class="audio-visualizer">
+          <div id="audio-bar" class="audio-bar"></div>
+        </div>
+        <div class="audio-stats">
+          <span id="audio-level">Level: 0%</span>
+          <span id="audio-packets">Packets: 0</span>
+          <span id="audio-latency">Latency: 0ms</span>
+        </div>
+        <div class="volume-control">
+          <label for="range">Volume: </label>
+          <input
+            type="range"
+            max="1"
+            value="0.5"
+            min="0"
+            id="range"
+            onchange="changeVolume(event)"
+            step="0.1"
+          />
+        </div>
+        <div class="controls">
+          <button onclick="toggleMicrophone()" id="micToggleBtn">
+            Enable Microphone
+          </button>
+          <button onclick="pauseAudio()" id="pauseBtn" disabled>Pause</button>
+          <button onclick="continueAudio()" id="continueBtn" disabled>
+            Continue
+          </button>
+          <button onclick="reconnect()" id="reconnectBtn">Reconnect</button>
+        </div>
+      </div>
+      <div id="debug"></div>
+    </div>
+
+    <script>
+      // Add dark mode support
+      function addDarkmodeWidget() {
+        new Darkmode().showWidget();
+      }
+      window.addEventListener("load", addDarkmodeWidget);
+
+      let ws = null;
+      let reconnectTimeout = null;
+      let lastFrameTime = 0;
+      let frameCount = 0;
+      let fps = 0;
+      let isMicrophoneEnabled = false;
+      const MAX_RECONNECT_DELAY = 5000;
+      let reconnectAttempts = 0;
+      let lastPingTime = 0;
+      let latency = 0;
+
+      // PCM Player Instance
+      let player = null;
+      let audioContext = null;
+      let audioBufferQueue = [];
+      const BUFFER_SIZE = 4096;
+      const MAX_BUFFERS = 3;
+
+      // PCM Worker for audio processing
+      var worker = new Worker(
+        URL.createObjectURL(
+          new Blob(
+            [
+              `
+        self.addEventListener('message', function (e) {
+           var mean = 0;
+           var samples_read = e.data.byteLength / 2; // Int16 = 2 bytes per sample
+            if (samples_read > 0) {
+                var byteArray = new Int16Array(e.data);
+                for (var i = 0; i < samples_read; ++i) {
+                    mean += Math.abs(byteArray[i]);
+                }
+                mean /= samples_read;
+                self.postMessage(mean);
+            }
+        });
+      `,
+            ],
+            { type: "text/javascript" }
+          )
+        )
+      );
+
+      // Setup graph
+      const arrayLength = 100;
+      var graphDataArray = [];
+
+      for (var i = 0; i < arrayLength; i++) {
+        graphDataArray[i] = 0;
+      }
+
+      var layout = {
+        title: "Audio Waveform",
+        paper_bgcolor: "#222",
+        plot_bgcolor: "#222",
+        xaxis: {
+          domain: [0, 1],
+          showticklabels: false,
+          color: "#FFF",
+        },
+        yaxis: {
+          domain: [0, 1],
+          color: "#FFF",
+          rangemode: "auto",
+        },
+        margin: {
+          l: 40,
+          r: 20,
+          t: 40,
+          b: 20,
+        },
+      };
+
+      Plotly.newPlot(
+        "graph",
+        [
+          {
+            y: graphDataArray,
+            mode: "lines",
+            line: { color: "#4CAF50" },
+          },
+        ],
+        layout
+      );
+
+      worker.addEventListener(
+        "message",
+        function (e) {
+          graphDataArray = graphDataArray.concat(e.data);
+          graphDataArray.splice(0, 1);
+
+          var data_update = {
+            y: [graphDataArray],
+          };
+
+          Plotly.update("graph", data_update);
+
+          // Also update the bar visualizer
+          updateAudioVisualizer(e.data);
+        },
+        false
+      );
+
+      // Initialize audio context and buffer
+      function initAudioContext() {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        audioBufferQueue = [];
+      }
+
+      // Process received audio data
+      function processAudioData(data) {
+        if (!audioContext) initAudioContext();
+
+        const audioBuffer = audioContext.createBuffer(1, BUFFER_SIZE, 44100);
+        const channelData = audioBuffer.getChannelData(0);
+
+        // Convert Int16 to Float32
+        const int16View = new Int16Array(data);
+        for (let i = 0; i < int16View.length; i++) {
+          channelData[i] = int16View[i] / 32768.0;
+        }
+
+        // Add to buffer queue
+        audioBufferQueue.push(audioBuffer);
+        if (audioBufferQueue.length > MAX_BUFFERS) {
+          audioBufferQueue.shift();
+        }
+
+        // Play if we have enough buffers
+        if (audioBufferQueue.length >= 2) {
+          playNextBuffer();
+        }
+      }
+
+      function playNextBuffer() {
+        if (audioBufferQueue.length === 0) return;
+
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBufferQueue.shift();
+        source.connect(audioContext.destination);
+        source.start();
+
+        source.onended = playNextBuffer;
+      }
+
+      // Initialize PCM player
+      function initPCMPlayer() {
+        if (player) {
+          player.destroy();
+        }
+
+        player = new PCMPlayer({
+          inputCodec: "Int16",
+          channels: 1,
+          sampleRate: 44100,
+          flushingTime: 100,
+        });
+
+        player.volume(document.getElementById("range").value);
+        return player;
+      }
+
+      // Update audio visualizer
+      function updateAudioVisualizer(amplitude) {
+        const maxHeight = 100; // 100% height
+        const normalizedHeight = Math.min(100, (amplitude / 32768) * 100);
+        document.getElementById(
+          "audio-bar"
+        ).style.height = `${normalizedHeight}%`;
+        document.getElementById(
+          "audio-level"
+        ).textContent = `Level: ${Math.round(normalizedHeight)}%`;
+      }
+
+      function log(message, isError = false) {
+        const debug = document.getElementById("debug");
+        const status = document.getElementById("status");
+        console.log(message);
+        debug.innerHTML += `<div class="${
+          isError ? "error" : ""
+        }">${new Date().toLocaleTimeString()}: ${message}</div>`;
+        debug.scrollTop = debug.scrollHeight;
+        if (isError) {
+          status.className = "error";
+          status.textContent = message;
+        }
+      }
+
+      function updateStats() {
+        document.getElementById(
+          "latency"
+        ).textContent = `Latency: ${latency}ms`;
+        document.getElementById("audio-status").textContent = `Audio: ${
+          isMicrophoneEnabled ? "Enabled" : "Disabled"
+        }`;
+      }
+
+      function connect() {
+        if (ws) {
+          ws.close();
+        }
+
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const wsUrl = `${protocol}//${window.location.host}`;
+
+        log(`Connecting to ${wsUrl}...`);
+        document.getElementById("status").textContent = "Connecting...";
+        document.getElementById("status").className = "";
+
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+          log("WebSocket Connected");
+          document.getElementById("status").textContent = "Connected";
+          document.getElementById("status").className = "success";
+          reconnectAttempts = 0;
+          lastPingTime = Date.now();
+
+          // Initialize PCM Player
+          initPCMPlayer();
+        };
+
+        ws.onclose = () => {
+          log("WebSocket Disconnected", true);
+          document.getElementById("status").textContent = "Disconnected";
+          document.getElementById("status").className = "error";
+          scheduleReconnect();
+
+          // Disable audio buttons
+          document.getElementById("pauseBtn").disabled = true;
+          document.getElementById("continueBtn").disabled = true;
+
+          if (player) {
+            player.destroy();
+            player = null;
+          }
+        };
+
+        ws.onerror = (error) => {
+          log("WebSocket Error: " + (error.message || "Unknown error"), true);
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            // Handle text messages (JSON data)
+            if (typeof event.data === "string") {
+              const message = JSON.parse(event.data);
+
+              if (message.type === "error") {
+                log("Error: " + message.message, true);
+              }
+
+              if (message.type === "info") {
+                log("Info: " + message.message);
+              }
+
+              // Handle audio data (in base64 format)
+              if (message.type === "audio" && isMicrophoneEnabled && player) {
+                // Update stats
+                const now = Date.now();
+                latency = now - message.timestamp;
+                updateStats();
+
+                document.getElementById(
+                  "audio-latency"
+                ).textContent = `Latency: ${latency}ms`;
+
+                // Process base64 audio data
+                const binaryString = window.atob(message.data);
+                const len = binaryString.length;
+                const bytes = new Uint8Array(len);
+
+                for (let i = 0; i < len; i++) {
+                  bytes[i] = binaryString.charCodeAt(i);
+                }
+
+                // Feed data to PCM player
+                player.feed(bytes.buffer);
+
+                // Send to worker for visualization
+                worker.postMessage(bytes.buffer);
+              }
+            }
+          } catch (error) {
+            log("Error processing message: " + error.message, true);
+          }
+        };
+
+        ws.onping = () => {
+          lastPingTime = Date.now();
+        };
+
+        ws.onpong = () => {
+          latency = Date.now() - lastPingTime;
+          updateStats();
+        };
+      }
+
+      function scheduleReconnect() {
+        if (reconnectTimeout) {
+          clearTimeout(reconnectTimeout);
+        }
+        const delay = Math.min(
+          1000 * Math.pow(2, reconnectAttempts),
+          MAX_RECONNECT_DELAY
+        );
+        reconnectAttempts++;
+        log(`Scheduling reconnect in ${delay}ms...`);
+        reconnectTimeout = setTimeout(connect, delay);
+      }
+
+      function reconnect() {
+        log("Manual reconnect requested");
+        if (reconnectTimeout) {
+          clearTimeout(reconnectTimeout);
+        }
+        connect();
+      }
+
+      // Toggle microphone function
+      function toggleMicrophone() {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          isMicrophoneEnabled = !isMicrophoneEnabled;
+
+          const cmd = isMicrophoneEnabled ? "mic_on" : "mic_off";
+          ws.send(cmd);
+
+          document.getElementById("micToggleBtn").textContent =
+            isMicrophoneEnabled ? "Disable Microphone" : "Enable Microphone";
+
+          document
+            .getElementById("micToggleBtn")
+            .classList.toggle("active", isMicrophoneEnabled);
+
+          log(`Microphone ${isMicrophoneEnabled ? "enabled" : "disabled"}`);
+
+          // Enable/disable pause button
+          document.getElementById("pauseBtn").disabled = !isMicrophoneEnabled;
+          document.getElementById("continueBtn").disabled = true;
+
+          updateStats();
+        } else {
+          log("Cannot toggle microphone - not connected", true);
+        }
+      }
+
+      // Volume control
+      function changeVolume(e) {
+        if (player) {
+          player.volume(document.getElementById("range").value);
+        }
+      }
+
+      // Pause audio
+      function pauseAudio() {
+        if (player) {
+          player.pause();
+          document.getElementById("pauseBtn").disabled = true;
+          document.getElementById("continueBtn").disabled = false;
+          log("Audio playback paused");
+        }
+      }
+
+      // Continue audio
+      function continueAudio() {
+        if (player) {
+          player.continue();
+          document.getElementById("pauseBtn").disabled = false;
+          document.getElementById("continueBtn").disabled = true;
+          log("Audio playback resumed");
+        }
+      }
+
+      // Start connection when page loads
+      window.onload = connect;
+
+      // Cleanup on page unload
+      window.onbeforeunload = () => {
+        if (ws) {
+          ws.close();
+        }
+        if (reconnectTimeout) {
+          clearTimeout(reconnectTimeout);
+        }
+        if (player) {
+          player.destroy();
+        }
+      };
+    </script>
+  </body>
+</html>

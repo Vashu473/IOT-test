@@ -1,0 +1,15 @@
+{
+  "name": "esp32cam-server",
+  "version": "1.0.0",
+  "description": "WebSocket server for ESP32-CAM streaming",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "canvas": "^3.1.0",
+    "express": "^4.17.1",
+    "socket.io": "^4.5.1",
+    "ws": "^8.2.3"
+  }
+}
